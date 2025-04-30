@@ -4,14 +4,17 @@ import json
 import pickle
 import torch
 import numpy as np
+import warnings
 from tqdm import tqdm
 from json import JSONEncoder
 from torch.utils.data import DataLoader
 from federated_parser import get_args
 from preprocessing.baselines_dataloader import load_data, divide_data
-from sklearn.metrics import f1_score
-from sklearn.cluster import KMeans
+from sklearn.metrics import f1_score, precision_score, recall_score, balanced_accuracy_score
+from sklearn.cluster import KMeans, MeanShift, estimate_bandwidth
 from sklearn.metrics import pairwise_distances
+from sklearn.decomposition import TruncatedSVD
+from scipy.stats import median_abs_deviation
 
 class PythonObjectEncoder(JSONEncoder):
     def default(self, obj):
@@ -37,6 +40,20 @@ class FederatedLearning:
             distribution_type=args.distribution_type,
             alpha=args.alpha
         )
+        
+        # 为SecDefender准备辅助验证集
+        if self.args.fed_algo == "SecDefender" and hasattr(self.args, 'use_auxiliary_dataset') and self.args.use_auxiliary_dataset:
+            # 从测试集中随机选择一部分数据作为辅助验证集
+            test_indices = list(range(len(self.testset)))
+            auxiliary_size = int(len(self.testset) * self.args.auxiliary_dataset_size)
+            auxiliary_indices = random.sample(test_indices, auxiliary_size)
+            
+            # 创建辅助验证集
+            # 注意：这里使用Subset而不是直接索引，以确保数据结构正确
+            self.auxiliary_dataset = torch.utils.data.Subset(self.testset, auxiliary_indices)
+            self.auxiliary_loader = DataLoader(self.auxiliary_dataset, batch_size=self.args.batch_size)
+            
+            print(f"SecDefender: 已创建大小为 {len(self.auxiliary_dataset)} 的辅助验证集")
         
         # 初始化客户端和服务器
         self.init_clients()
@@ -318,6 +335,14 @@ class FederatedLearning:
         elif self.args.fed_algo == "Auror":
             # Auror: 基于聚类的异常检测，识别并丢弃可能的恶意更新
             aggregated_weights = self.auror_aggregate(updates)
+        
+        elif self.args.fed_algo == "SecDefender":
+            # SecDefender: 基于辅助验证集评估模型质量，剔除低质量模型
+            aggregated_weights = self.secdefender_aggregate(updates)
+            
+        elif self.args.fed_algo == "MSGuard":
+            # MSGuard: 多策略防御机制，结合范数筛选、符号统计、余弦相似度和谱分析
+            aggregated_weights = self.msguard_aggregate(updates)
         
         return aggregated_weights
     
@@ -903,6 +928,153 @@ class FederatedLearning:
         
         return aggregated_weights
     
+    def secdefender_aggregate(self, updates):
+        """
+        SecDefender聚合算法:
+        基于辅助验证集评估模型质量，剔除低质量模型
+        
+        参数:
+        - updates: 客户端更新字典，格式为 {client_id: (weights, num_samples, loss)}
+        
+        返回:
+        - aggregated_weights: 聚合后的模型参数
+        """
+        # 提取所有客户端的更新
+        client_weights = {}
+        client_sample_sizes = {}
+        
+        for client_id, (weights, num_samples, _) in updates.items():
+            client_weights[client_id] = weights
+            client_sample_sizes[client_id] = num_samples
+        
+        # 客户端数量检查
+        num_clients = len(client_weights)
+        if num_clients < 3:
+            print(f"警告: 客户端数量不足，无法进行有效评估。至少需要3个客户端，但只有{num_clients}个。回退到FedAvg。")
+            return self.fedavg_aggregate(updates)
+        
+        # 使用辅助验证集评估每个客户端模型质量
+        if not hasattr(self.args, 'use_auxiliary_dataset') or not self.args.use_auxiliary_dataset:
+            print("警告: SecDefender需要辅助验证集，但未启用。回退到FedAvg。")
+            return self.fedavg_aggregate(updates)
+        
+        # 创建临时模型用于评估
+        temp_model = self.create_model()
+        client_scores = {}
+        
+        print(f"SecDefender: 使用辅助验证集评估 {num_clients} 个客户端模型质量")
+        
+        # 评估每个客户端模型
+        for client_id, weights in client_weights.items():
+            # 加载客户端模型权重
+            temp_model.load_state_dict(weights)
+            # 评估模型并获取指定的质量指标
+            score, _ = self.secdefender_evaluate_client(temp_model, self.args.model_quality_metric)
+            client_scores[client_id] = score
+            print(f"客户端 {client_id} 评估结果: {self.args.model_quality_metric}={score:.4f}")
+        
+        # 计算质量指标的均值
+        mean_score = sum(client_scores.values()) / len(client_scores)
+        print(f"所有客户端的平均质量指标 {self.args.model_quality_metric}={mean_score:.4f}")
+        
+        # 找出质量指标低于均值的客户端
+        low_quality_clients = []
+        for client_id, score in client_scores.items():
+            if score <= mean_score:
+                low_quality_clients.append((client_id, score))
+        
+        # 按质量指标从低到高排序
+        low_quality_clients.sort(key=lambda x: x[1])
+        
+        # 确定要剔除的客户端数量（不超过最大剔除数量且不超过低质量客户端总数）
+        max_exclude = min(self.args.max_exclude_count, len(low_quality_clients))
+        excluded_clients = [client_id for client_id, _ in low_quality_clients[:max_exclude]]
+        
+        print(f"SecDefender: 剔除 {len(excluded_clients)}/{num_clients} 个低质量模型:")
+        for client_id in excluded_clients:
+            print(f"- 客户端 {client_id}: {self.args.model_quality_metric}={client_scores[client_id]:.4f}")
+        
+        # 保留高质量客户端模型
+        benign_client_ids = [client_id for client_id in client_weights.keys() if client_id not in excluded_clients]
+        
+        # 使用高质量客户端的更新进行聚合 (FedAvg方式)
+        total_weight = 0
+        aggregated_weights = None
+        
+        for client_id in benign_client_ids:
+            client_weight = client_sample_sizes[client_id]
+            total_weight += client_weight
+            if aggregated_weights is None:
+                aggregated_weights = {k: v.clone() * client_weight for k, v in client_weights[client_id].items()}
+            else:
+                for k in aggregated_weights.keys():
+                    aggregated_weights[k] += client_weights[client_id][k] * client_weight
+        
+        # 计算加权平均
+        if total_weight > 0:
+            for k in aggregated_weights.keys():
+                aggregated_weights[k] = aggregated_weights[k] / total_weight
+                
+        return aggregated_weights
+    
+    def secdefender_evaluate_client(self, client_model, metric='f1_score'):
+        """
+        使用辅助验证集评估客户端模型质量
+        
+        参数:
+        - client_model: 待评估的客户端模型
+        - metric: 评估指标，可选'f1_score', 'accuracy', 'precision', 'recall', 'balanced_accuracy'
+        
+        返回:
+        - score: 所选指标的评分
+        - metrics_dict: 包含多个指标的字典
+        """
+        client_model.eval()
+        
+        # 在辅助验证集上评估
+        correct = 0
+        total = 0
+        all_preds = []
+        all_targets = []
+        
+        with torch.no_grad():
+            for data, target in self.auxiliary_loader:
+                data, target = data.to(self.device), target.to(self.device)
+                outputs = client_model(data)
+                _, predicted = torch.max(outputs.data, 1)
+                total += target.size(0)
+                correct += (predicted == target).sum().item()
+                
+                # 收集预测和目标值用于计算各种指标
+                all_preds.extend(predicted.cpu().numpy())
+                all_targets.extend(target.cpu().numpy())
+        
+        # 计算各种指标
+        accuracy = correct / total if total > 0 else 0
+        try:
+            f1 = f1_score(all_targets, all_preds, average='macro')
+            precision = precision_score(all_targets, all_preds, average='macro')
+            recall = recall_score(all_targets, all_preds, average='macro')
+            balanced_acc = balanced_accuracy_score(all_targets, all_preds)
+        except:
+            # 处理可能的错误（如某一类别没有样本）
+            f1 = 0
+            precision = 0
+            recall = 0
+            balanced_acc = 0
+        
+        # 创建指标字典
+        metrics_dict = {
+            'accuracy': accuracy,
+            'f1_score': f1,
+            'precision': precision,
+            'recall': recall,
+            'balanced_accuracy': balanced_acc
+        }
+        
+        # 返回所选指标的值和完整指标字典
+        return metrics_dict.get(metric, f1), metrics_dict
+    
     def evaluate(self):
         """评估服务器模型性能"""
         self.server_model.eval()
@@ -1003,6 +1175,231 @@ class FederatedLearning:
             )
             with open(result_path, 'w') as f:
                 json.dump(self.results, f, cls=PythonObjectEncoder)
+
+    def msguard_aggregate(self, updates):
+        """
+        MSGuard多策略防御机制:
+        结合范数筛选、符号统计、余弦相似度和谱分析等多种策略防御梯度攻击，并通过Mean Shift聚类筛选可信梯度
+        
+        参数:
+        - updates: 客户端更新字典，格式为 {client_id: (weights, num_samples, loss)}
+        
+        返回:
+        - aggregated_weights: 聚合后的模型参数
+        """
+        # 提取所有客户端的更新
+        client_weights = {}
+        client_sample_sizes = {}
+        client_ids = []
+        
+        for client_id, (weights, num_samples, _) in updates.items():
+            client_weights[client_id] = weights
+            client_sample_sizes[client_id] = num_samples
+            client_ids.append(client_id)
+        
+        # 客户端数量检查
+        num_clients = len(client_weights)
+        if num_clients < 3:
+            print(f"警告: 客户端数量不足，无法进行MSGuard防御。至少需要3个客户端，但只有{num_clients}个。回退到FedAvg。")
+            return self.fedavg_aggregate(updates)
+        
+        print(f"MSGuard: 对 {num_clients} 个客户端更新进行多策略防御分析")
+        
+        # 1. 转换模型参数为向量表示
+        weight_vectors = []
+        weight_vector_dict = {}
+        param_shapes = {}  # 记录每个参数的形状，用于后续重构
+        
+        for client_id, weights in client_weights.items():
+            # 创建参数字典形状的副本（如果还没有）
+            if not param_shapes:
+                for name, param in weights.items():
+                    param_shapes[name] = param.shape
+            
+            # 平铺所有参数为一个向量
+            vector = []
+            for name, param in weights.items():
+                vector.append(param.view(-1))
+            
+            client_vector = torch.cat(vector).cpu().numpy()
+            weight_vectors.append(client_vector)
+            weight_vector_dict[client_id] = client_vector
+        
+        # 将所有客户端的权重向量堆叠为一个矩阵
+        weight_matrix = np.vstack(weight_vectors)
+        
+        # 2. 范数筛选 - 过滤掉范数过大或过小的梯度
+        norms = np.linalg.norm(weight_matrix, axis=1)
+        lower_bound = self.args.msguard_norm_lower
+        upper_bound = self.args.msguard_norm_upper
+        
+        # 筛选范围内的客户端
+        valid_norm_indices = np.where((norms >= lower_bound) & (norms <= upper_bound))[0]
+        
+        if len(valid_norm_indices) < 3:
+            print(f"警告: 范数筛选后客户端数量不足，剩余{len(valid_norm_indices)}个。放宽范围或回退到FedAvg。")
+            return self.fedavg_aggregate(updates)
+        
+        # 筛选后的矩阵和客户端ID
+        filtered_matrix = weight_matrix[valid_norm_indices]
+        filtered_client_ids = [client_ids[i] for i in valid_norm_indices]
+        
+        print(f"MSGuard范数筛选: 保留 {len(filtered_client_ids)}/{num_clients} 个客户端 (范数范围 [{lower_bound}, {upper_bound}])")
+        
+        # 3. 特征工程
+        # 3.1 符号统计特征 - 计算每个梯度正、零、负的元素数量占比
+        sign_features = []
+        beta = self.args.msguard_sign_sample_ratio  # 采样比例
+        
+        for vec in filtered_matrix:
+            # 随机采样部分元素计算符号统计，提高效率
+            if 0 < beta < 1:
+                sample_size = int(len(vec) * beta)
+                indices = np.random.choice(len(vec), sample_size, replace=False)
+                sampled_vec = vec[indices]
+            else:
+                sampled_vec = vec
+                
+            # 计算正、零、负元素数量
+            pos = np.sum(sampled_vec > 0)
+            zero = np.sum(sampled_vec == 0)
+            neg = np.sum(sampled_vec < 0)
+            total = len(sampled_vec)
+            
+            # 计算比例并添加到特征中
+            sign_features.append([pos/total, zero/total, neg/total])
+        
+        sign_features = np.array(sign_features)
+        
+        # 3.2 余弦相似度特征 - 计算每个梯度与其他梯度的余弦相似度中位数
+        cosine_features = []
+        
+        # 计算余弦相似度矩阵
+        normed_matrix = filtered_matrix / np.linalg.norm(filtered_matrix, axis=1)[:, np.newaxis]
+        cosine_sim_matrix = np.dot(normed_matrix, normed_matrix.T)
+        
+        for i in range(len(filtered_client_ids)):
+            # 获取与当前客户端的所有相似度，并排除自身
+            sims = cosine_sim_matrix[i].copy()
+            sims[i] = np.nan  # 排除自身
+            
+            # 计算中位数相似度作为特征
+            med_sim = np.nanmedian(sims)
+            cosine_features.append([med_sim])
+        
+        cosine_features = np.array(cosine_features)
+        
+        # 3.3 谱异常分数 - 使用SVD检测异常方向
+        spectral_features = []
+        
+        # 如果维度过高，采样降维提高效率
+        svd_dim = min(self.args.msguard_svd_dim, filtered_matrix.shape[1])
+        
+        # 使用Truncated SVD进行降维
+        svd = TruncatedSVD(n_components=svd_dim, random_state=self.args.i_seed)
+        reduced_matrix = svd.fit_transform(filtered_matrix)
+        
+        # 对降维后的矩阵进行SVD分解
+        U, S, Vt = np.linalg.svd(reduced_matrix, full_matrices=False)
+        
+        # 计算每个向量在第一主成分方向上的投影平方，作为异常分数
+        scores = U[:, 0] ** 2
+        
+        # 计算异常分数的中位数和绝对中位差
+        med_score = np.median(scores)
+        mad = median_abs_deviation(scores, scale=1)
+        
+        # 使用修正的Z分数作为谱特征
+        if mad > 0:
+            z_scores = 0.6745 * (scores - med_score) / mad
+            # 将异常分数映射到[0,1]区间
+            normalized_scores = 1 / (1 + np.exp(-z_scores))
+        else:
+            normalized_scores = np.zeros_like(scores)
+            
+        spectral_features = normalized_scores.reshape(-1, 1)
+        
+        # 4. 特征拼接
+        # 将三类特征拼接成一个特征向量
+        combined_features = np.hstack([sign_features, cosine_features, spectral_features])
+        
+        # 5. 使用Mean Shift聚类识别可信梯度集合
+        try:
+            # 如果未指定带宽，则自动估计
+            if self.args.msguard_bandwidth is None:
+                bandwidth = estimate_bandwidth(combined_features, quantile=0.3, n_samples=min(len(combined_features), 100))
+                if bandwidth <= 0:
+                    bandwidth = np.median(pairwise_distances(combined_features)) / 2
+                    if bandwidth <= 0:
+                        bandwidth = 0.5  # 默认带宽
+            else:
+                bandwidth = self.args.msguard_bandwidth
+                
+            # 应用Mean Shift聚类
+            ms = MeanShift(bandwidth=bandwidth, bin_seeding=True)
+            ms.fit(combined_features)
+            labels = ms.labels_
+            
+            # 找出聚类的大小
+            unique_labels = np.unique(labels)
+            cluster_sizes = [np.sum(labels == label) for label in unique_labels]
+            
+            # 选择最大簇作为可信集合
+            largest_cluster = unique_labels[np.argmax(cluster_sizes)]
+            trusted_indices = np.where(labels == largest_cluster)[0]
+            trusted_client_ids = [filtered_client_ids[i] for i in trusted_indices]
+            
+            print(f"MSGuard聚类分析: 共{len(unique_labels)}个簇，选择最大簇（{len(trusted_client_ids)}个客户端）作为可信集合")
+            
+            if len(trusted_client_ids) < 1:
+                print("警告: 没有客户端被识别为可信，回退到所有范数筛选后的客户端")
+                trusted_client_ids = filtered_client_ids
+        except Exception as e:
+            print(f"MSGuard聚类过程中出错: {e}。回退到范数筛选后的所有客户端。")
+            trusted_client_ids = filtered_client_ids
+        
+        # 6. 加权聚合 - 根据范数与中位数的比值分配权重
+        trusted_weights = {}
+        trusted_norms = []
+        
+        for client_id in trusted_client_ids:
+            client_vector = weight_vector_dict[client_id]
+            client_norm = np.linalg.norm(client_vector)
+            trusted_weights[client_id] = client_weights[client_id]
+            trusted_norms.append(client_norm)
+        
+        # 计算范数中位数
+        median_norm = np.median(trusted_norms)
+        
+        # 创建结果字典
+        aggregated_weights = {}
+        total_weight = 0
+        
+        # 对每个参数层进行加权聚合
+        for client_id, norm in zip(trusted_client_ids, trusted_norms):
+            # 计算权重：使用范数与中位数的比值的倒数作为权重
+            # 范数越接近中位数，权重越大
+            weight_ratio = median_norm / max(norm, 1e-10)
+            # 限制权重范围，防止极端值
+            bounded_ratio = min(max(weight_ratio, 0.5), 2.0)
+            
+            client_weight = client_sample_sizes[client_id] * bounded_ratio
+            total_weight += client_weight
+            
+            if aggregated_weights == {}:
+                aggregated_weights = {k: v.clone() * client_weight for k, v in trusted_weights[client_id].items()}
+            else:
+                for k in aggregated_weights.keys():
+                    aggregated_weights[k] += trusted_weights[client_id][k] * client_weight
+        
+        # 计算加权平均
+        if total_weight > 0:
+            for k in aggregated_weights.keys():
+                aggregated_weights[k] = aggregated_weights[k] / total_weight
+                
+        print(f"MSGuard完成：最终使用{len(trusted_client_ids)}/{num_clients}个客户端进行加权聚合")
+        
+        return aggregated_weights
 
 def main():
     args = get_args()

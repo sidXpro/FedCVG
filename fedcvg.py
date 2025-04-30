@@ -20,18 +20,18 @@ class PythonObjectEncoder(JSONEncoder):
             return super().default(self, obj )
         return {'_python_object': pickle.dumps(obj).decode('latin-1')}
   
-class FedCVG:
+class FedHyb:
     def __init__(self, args):
-        """Initialize FedCVG algorithm"""
+        """初始化FedHyb算法"""
         self.args = args
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # Set random seed
+        # 设置随机种子
         np.random.seed(args.i_seed)
         torch.manual_seed(args.i_seed)
         random.seed(args.i_seed)
         
-        # Load data
+        # 加载数据
         self.trainset_config, self.testset = divide_data(
             num_client=args.num_client,
             dataset_name=args.dataset,
@@ -40,11 +40,11 @@ class FedCVG:
             alpha=args.alpha
         )
         
-        # Initialize clients and server
+        # 初始化客户端和服务器
         self.init_clients()
         self.init_server()
         
-        # Initialize results recording
+        # 初始化结果记录
         self.current_phase = 1
         self.results = {
             'server': {
@@ -55,57 +55,57 @@ class FedCVG:
             }
         }
         
-        # New: Initialize data structures for gradient recording and client selection history
-        self.client_gradients = {}  # Store client gradients
-        self.client_last_selected = {}  # Record when each client was last selected
+        # 新增：为梯度记录和客户端选择历史初始化数据结构
+        self.client_gradients = {}  # 存储客户端梯度
+        self.client_last_selected = {}  # 记录每个客户端上次被选择的轮数
         for client_id in self.clients:
             self.client_gradients[client_id] = None
-            self.client_last_selected[client_id] = 0  # Initialize to round 0
+            self.client_last_selected[client_id] = 0  # 初始化为第0轮
         
-        # Initialize gradient decay parameter for each client
+        # 为每个客户端初始化梯度记录的衰减参数
         if hasattr(args, 'gradient_decay'):
             self.gradient_decay = args.gradient_decay
         else:
-            self.gradient_decay = 0.9  # Default decay rate
+            self.gradient_decay = 0.9  # 默认衰减率
         
-        # Initialize gradient threshold
+        # 初始化梯度阈值
         if hasattr(args, 'gradient_threshold'):
             self.gradient_threshold = args.gradient_threshold
         else:
-            self.gradient_threshold = 0.01  # Default threshold
+            self.gradient_threshold = 0.01  # 默认阈值
         
-        # Initialize variables needed for clustering and reputation mechanisms
+        # 初始化聚类和信誉机制所需的变量
         self.use_clustering = hasattr(args, 'use_clustering') and args.use_clustering
         self.use_reputation = hasattr(args, 'use_reputation') and args.use_reputation
         
         if self.use_clustering or self.use_reputation:
-            # Store the number of times each client is marked as malicious
+            # 存储每个客户端被标记为恶意的次数
             self.malicious_counts = {client_id: 0 for client_id in self.clients}
             
-            # Store the list of clients currently considered malicious
+            # 存储当前被认为是恶意的客户端列表
             self.blacklisted_clients = set()
             
-            # Set threshold: number of times marked as malicious exceeds the proportion of phase 1 training rounds
+            # 设置阈值：被标记为恶意的次数超过第一阶段训练轮数的比例
             self.reputation_threshold = args.clustering_threshold * args.phase1_rounds if hasattr(args, 'clustering_threshold') else 0.1 * args.phase1_rounds
             
-            print(f"Enabled {'clustering mechanism' if self.use_clustering else ''}{'and' if self.use_clustering and self.use_reputation else ''}{'reputation mechanism' if self.use_reputation else ''}")
+            print(f"已启用{'聚类机制' if self.use_clustering else ''}{'和' if self.use_clustering and self.use_reputation else ''}{'信誉机制' if self.use_reputation else ''}")
             if self.use_reputation:
-                print(f"Reputation threshold set to: {self.reputation_threshold:.1f} rounds ({args.clustering_threshold if hasattr(args, 'clustering_threshold') else 0.1:.1%} of phase 1 total rounds)")
+                print(f"信誉阈值设置为: {self.reputation_threshold:.1f}轮 (第一阶段总轮数的{args.clustering_threshold if hasattr(args, 'clustering_threshold') else 0.1:.1%})")
         
-        # Initialize control variables for SCAFFOLD algorithm (if using SCAFFOLD in phase 1)
+        # 为SCAFFOLD算法初始化控制变量（如果第一阶段使用SCAFFOLD）
         if hasattr(args, 'scaffold_for_phase1') and args.scaffold_for_phase1:
             self.control_variate = {}
             for name, param in self.server_model.state_dict().items():
                 self.control_variate[name] = torch.zeros_like(param)
             
-            # Initialize control variables for each client
+            # 为每个客户端初始化控制变量
             for client_id in self.clients:
                 self.clients[client_id]['control_variate'] = {}
                 for name, param in self.server_model.state_dict().items():
                     self.clients[client_id]['control_variate'][name] = torch.zeros_like(param)
     
     def init_clients(self):
-        """Initialize all clients"""
+        """初始化所有客户端"""
         self.clients = {}
         for client_id in self.trainset_config['users']:
             self.clients[client_id] = {
@@ -115,12 +115,12 @@ class FedCVG:
             }
     
     def init_server(self):
-        """Initialize server"""
+        """初始化服务器"""
         self.server_model = self.create_model()
         self.test_loader = DataLoader(self.testset, batch_size=self.args.batch_size)
     
     def create_model(self):
-        """Create model instance"""
+        """创建模型实例"""
         from models import LeNet, CNN, ResNet18, ResNet34, ResNet50, AlexCifarNet
         
         if self.args.model == 'LeNet':
@@ -136,39 +136,39 @@ class FedCVG:
         elif self.args.model == 'AlexCifarNet':
             return AlexCifarNet().to(self.device)
         else:
-            raise NotImplementedError(f"Model {self.args.model} not implemented")
+            raise NotImplementedError(f"模型 {self.args.model} 尚未实现")
     
     def freeze_feature_layers(self, model, phase):
         """
-        Freeze or unfreeze feature extraction layers based on training phase and model type
+        根据训练阶段和模型类型冻结或解冻特征提取层
         
-        Parameters:
-            model: Model instance
-            phase: Training phase, 1 for phase 1 (all layers trainable), 2 for phase 2 (freeze feature extraction layers)
+        参数:
+            model: 模型实例
+            phase: 训练阶段，1表示第一阶段(所有层可训练)，2表示第二阶段(冻结特征提取层)
         
-        Returns:
-            trainable_params: List of parameters to train
+        返回:
+            trainable_params: 需要训练的参数列表
         """
-        # If phase 1, all parameters are trainable
+        # 如果是第一阶段，所有参数都可训练
         if phase == 1:
             for param in model.parameters():
                 param.requires_grad = True
             return model.parameters()
         
-        # In phase 2, freeze feature extraction layers, only train classification layers
+        # 在第二阶段，冻结特征提取层，只训练分类层
         trainable_params = []
         
-        # Determine feature extraction and classification layers based on model type
+        # 根据模型类型确定特征提取层和分类层
         if isinstance(model, type(self.server_model)):
             model_name = model.__class__.__name__
             
-            # Handle different models
+            # 针对不同模型进行处理
             if 'LeNet' in model_name:
-                # LeNet: conv1, conv2 are feature extraction layers; fc1, fc2, fc3 are classification layers
+                # LeNet: conv1, conv2为特征提取层；fc1, fc2, fc3为分类层
                 feature_layers = ['conv1', 'conv2']
                 classifier_layers = ['fc1', 'fc2', 'fc3']
                 
-                # Freeze feature extraction layers
+                # 冻结特征提取层
                 for name, param in model.named_parameters():
                     if any(layer in name for layer in feature_layers):
                         param.requires_grad = False
@@ -177,11 +177,11 @@ class FedCVG:
                         trainable_params.append(param)
             
             elif 'CNN' in model_name:
-                # CNN: conv1, conv2, conv3 are feature extraction layers; fc1, fc2 are classification layers
+                # CNN: conv1, conv2, conv3为特征提取层；fc1, fc2为分类层
                 feature_layers = ['conv1', 'conv2', 'conv3']
                 classifier_layers = ['fc1', 'fc2']
                 
-                # Freeze feature extraction layers
+                # 冻结特征提取层
                 for name, param in model.named_parameters():
                     if any(layer in name for layer in feature_layers):
                         param.requires_grad = False
@@ -190,11 +190,11 @@ class FedCVG:
                         trainable_params.append(param)
             
             elif 'ResNet' in model_name:
-                # ResNet: conv1, layer1-4 are feature extraction layers; linear is classification layer
+                # ResNet: conv1, layer1-4为特征提取层；linear为分类层
                 feature_layers = ['conv1', 'layer1', 'layer2', 'layer3', 'layer4', 'bn']
                 classifier_layers = ['linear']
                 
-                # Freeze feature extraction layers
+                # 冻结特征提取层
                 for name, param in model.named_parameters():
                     if any(layer in name for layer in feature_layers):
                         param.requires_grad = False
@@ -203,8 +203,8 @@ class FedCVG:
                         trainable_params.append(param)
             
             elif 'AlexCifarNet' in model_name:
-                # AlexNet: features are feature extraction layers; classifier are classification layers
-                # Freeze feature extraction layers
+                # AlexNet: features为特征提取层；classifier为分类层
+                # 冻结特征提取层
                 for name, param in model.named_parameters():
                     if 'features' in name:
                         param.requires_grad = False
@@ -213,27 +213,27 @@ class FedCVG:
                         trainable_params.append(param)
             
             else:
-                # Default case: freeze first 70% of layers (assuming earlier layers are feature extraction)
+                # 默认情况：只冻结前70%的层（假设前面的层是特征提取层）
                 all_params = list(model.named_parameters())
                 split_idx = int(len(all_params) * 0.7)
                 
                 for i, (name, param) in enumerate(all_params):
-                    if i < split_idx:  # First 70% are feature extraction layers
+                    if i < split_idx:  # 前70%为特征提取层
                         param.requires_grad = False
-                    else:  # Last 30% are classification layers
+                    else:  # 后30%为分类层
                         param.requires_grad = True
                         trainable_params.append(param)
                         
-            # Display classification layer information once when entering phase 2
+            # 在进入第二阶段时显示一次分类层信息
             if phase == 2 and self.current_phase == 1 and self.current_round == self.args.phase1_rounds - 1:
                 model_state = model.state_dict()
-                print(f"\nPhase 2 Information: {'='*40}")
-                print(f"Model: {model_name}")
-                print(f"Frozen feature extraction layers: {sum(1 for name, param in model.named_parameters() if not param.requires_grad)}")
-                print(f"Trainable classification layers: {len(trainable_params)}")
+                print(f"\n第二阶段信息: {'='*40}")
+                print(f"模型: {model_name}")
+                print(f"冻结特征提取层层数: {sum(1 for name, param in model.named_parameters() if not param.requires_grad)}")
+                print(f"可训练分类层层数: {len(trainable_params)}")
                 
-                # Print classification layer names and dimensions
-                print("\nClassification layer dimensions:")
+                # 打印分类层的名称和维度
+                print("\n分类层维度:")
                 for name, param in model.named_parameters():
                     if param.requires_grad:
                         print(f"  - {name}: {list(param.size())}")
@@ -241,362 +241,401 @@ class FedCVG:
                 
             return trainable_params
         else:
-            # If model type cannot be identified, all parameters are trainable
-            return model.parameters() 
-
+            # 如果模型类型无法识别，则所有参数可训练
+            return model.parameters()
+    
     def client_update(self, client_id, phase=1):
         """
-        Client local training
+        客户端本地训练
         
-        Parameters:
-            client_id: Client ID
-            phase: Training phase, 1 or 2
+        参数:
+        - client_id: 客户端ID
+        - phase: 训练阶段，1表示第一阶段，2表示第二阶段
         
-        Returns:
-            model_update: Model parameter update (weight difference)
-            loss: Training loss
+        返回:
+        - model_state: 更新后的模型状态
+        - data_size: 客户端数据大小
+        - epoch_loss: 客户端训练损失
         """
         client = self.clients[client_id]
+        model = client['model']
+        model.train()
         
-        # Set model to training mode
-        client['model'].train()
+        # 获取模型全局参数
+        global_params = {}
+        for name, param in self.server_model.named_parameters():
+            global_params[name] = param.clone()
         
-        # Get data loader for this client
-        train_loader = DataLoader(client['data'], batch_size=self.args.batch_size, shuffle=True)
+        # 设置学习率
+        if phase == 1:
+            lr = self.args.learning_rate
+        else:
+            lr = self.args.phase2_learning_rate
         
-        # Set learning rate based on phase
-        lr = self.args.learning_rate if phase == 1 else self.args.phase2_learning_rate
+        # 根据当前阶段冻结或解冻特征提取层，并获取可训练参数
+        trainable_params = self.freeze_feature_layers(model, phase)
         
-        # Get trainable parameters based on phase
-        trainable_params = self.freeze_feature_layers(client['model'], phase)
-        
-        # Create optimizer for client model
-        client['optimizer'] = optim.SGD(
+        # 设置优化器和损失函数（只优化可训练参数）
+        optimizer = optim.SGD(
             trainable_params,
             lr=lr,
             momentum=self.args.momentum,
             weight_decay=self.args.weight_decay
         )
-        
-        # Initialize loss
-        train_loss = 0.0
-        
-        # Copy server model parameters to client model
-        with torch.no_grad():
-            for name, param in self.server_model.state_dict().items():
-                client['model'].state_dict()[name].copy_(param.clone())
-        
-        # First phase specific implementations
-        if phase == 1:
-            # Use SCAFFOLD algorithm
-            if hasattr(self.args, 'scaffold_for_phase1') and self.args.scaffold_for_phase1:
-                return self._client_update_scaffold(client_id, train_loader)
-            # Use FedProx algorithm
-            else:
-                return self._client_update_fedprox(client_id, train_loader)
-        
-        # Second phase uses FedAvg algorithm by default
-        else:
-            return self._client_update_fedavg(client_id, train_loader)
-    
-    def _client_update_fedavg(self, client_id, train_loader):
-        """Standard FedAvg algorithm client update"""
-        client = self.clients[client_id]
         criterion = torch.nn.CrossEntropyLoss()
         
-        # Save initial model parameters for calculating update later
-        init_params = {name: param.clone() for name, param in client['model'].state_dict().items()}
+        # 设置近端项系数（如果使用FedProx）
+        mu = self.args.fedprox_mu if phase == 1 and not (hasattr(self.args, 'scaffold_for_phase1') and self.args.scaffold_for_phase1) else 0
         
-        # Training for local epochs
-        train_loss = 0.0
+        # 如果使用SCAFFOLD，准备控制变量
+        if phase == 1 and hasattr(self.args, 'scaffold_for_phase1') and self.args.scaffold_for_phase1:
+            # 获取当前客户端和服务器的控制变量
+            client_control = client['control_variate']
+            server_control = self.control_variate
+            
+            # 保存本地控制变量的副本用于更新
+            old_client_control = {k: v.clone() for k, v in client_control.items()}
+            
+            # 保存参数初始值用于更新控制变量
+            init_params = {k: v.clone() for k, v in model.state_dict().items()}
+        
+        # 创建数据加载器
+        train_loader = DataLoader(
+            client['data'],
+            batch_size=self.args.batch_size,
+            shuffle=True
+        )
+        
+        # 如果数据量很小，打印出来
+        num_batches = len(train_loader)
+        if num_batches < 5 and phase == 1: # 只在第一阶段显示这些信息
+            print(f"客户端 {client_id} 数据较少:")
+            print(f"- 样本数: {len(client['data'])}")
+            print(f"- 总batch数: {num_batches}\n")
+        
+        # 本地训练
+        epoch_loss = 0
         for epoch in range(self.args.num_local_epoch):
-            epoch_loss = 0.0
-            for inputs, labels in train_loader:
-                inputs, labels = inputs.to(self.device), labels.to(self.device)
-                
-                # Forward pass
-                outputs = client['model'](inputs)
-                loss = criterion(outputs, labels)
-                
-                # Backward and optimize
-                client['optimizer'].zero_grad()
-                loss.backward()
-                client['optimizer'].step()
-                
-                epoch_loss += loss.item()
+            batch_loss = 0
+            batch_count = 0
             
-            train_loss += epoch_loss / len(train_loader)
-        
-        # Calculate average training loss
-        train_loss /= self.args.num_local_epoch
-        
-        # Calculate model update (weight difference)
-        model_update = {}
-        for name, param in client['model'].state_dict().items():
-            if param.requires_grad:
-                model_update[name] = param.clone() - init_params[name]
-            else:
-                model_update[name] = torch.zeros_like(param)
-        
-        # Store client gradient for future use
-        if hasattr(self.args, 'use_historical_gradients') and self.args.use_historical_gradients:
-            self.client_gradients[client_id] = {k: v.clone() for k, v in model_update.items()}
-        
-        return model_update, train_loss
-    
-    def _client_update_fedprox(self, client_id, train_loader):
-        """FedProx algorithm client update with proximal term"""
-        client = self.clients[client_id]
-        criterion = torch.nn.CrossEntropyLoss()
-        
-        # Get proximal term coefficient
-        mu = self.args.fedprox_mu
-        
-        # Save initial model parameters for proximal term and calculating update later
-        global_params = {name: param.clone() for name, param in self.server_model.state_dict().items()}
-        init_params = {name: param.clone() for name, param in client['model'].state_dict().items()}
-        
-        # Training for local epochs
-        train_loss = 0.0
-        for epoch in range(self.args.num_local_epoch):
-            epoch_loss = 0.0
-            for inputs, labels in train_loader:
-                inputs, labels = inputs.to(self.device), labels.to(self.device)
+            for data, target in train_loader:
+                data, target = data.to(self.device), target.to(self.device)
+                optimizer.zero_grad()
+                output = model(data)
                 
-                # Forward pass
-                outputs = client['model'](inputs)
+                # 计算原始损失
+                loss = criterion(output, target)
                 
-                # FedProx loss includes proximal term
-                loss = criterion(outputs, labels)
-                
-                # Add proximal term to loss
-                if mu > 0:
-                    proximal_term = 0.0
-                    for name, param in client['model'].named_parameters():
-                        if param.requires_grad:
-                            proximal_term += (mu / 2) * torch.norm((param - global_params[name]))**2
-                    
-                    loss += proximal_term
-                
-                # Backward and optimize
-                client['optimizer'].zero_grad()
-                loss.backward()
-                client['optimizer'].step()
-                
-                epoch_loss += loss.item()
-            
-            train_loss += epoch_loss / len(train_loader)
-        
-        # Calculate average training loss
-        train_loss /= self.args.num_local_epoch
-        
-        # Calculate model update (weight difference)
-        model_update = {}
-        for name, param in client['model'].state_dict().items():
-            if param.requires_grad:
-                model_update[name] = param.clone() - init_params[name]
-            else:
-                model_update[name] = torch.zeros_like(param)
-        
-        # Store client gradient for future use
-        if hasattr(self.args, 'use_historical_gradients') and self.args.use_historical_gradients:
-            self.client_gradients[client_id] = {k: v.clone() for k, v in model_update.items()}
-        
-        return model_update, train_loss
-    
-    def _client_update_scaffold(self, client_id, train_loader):
-        """SCAFFOLD algorithm client update with control variates"""
-        client = self.clients[client_id]
-        criterion = torch.nn.CrossEntropyLoss()
-        
-        # Get SCAFFOLD control variables learning rate
-        c_lr = self.args.scaffold_c_lr if hasattr(self.args, 'scaffold_c_lr') else 0.1 * self.args.learning_rate
-        
-        # Save initial model parameters for calculating update later
-        init_params = {name: param.clone() for name, param in client['model'].state_dict().items()}
-        
-        # Get server and client control variates
-        c_global = self.control_variate
-        c_local = client['control_variate']
-        
-        # Training for local epochs
-        train_loss = 0.0
-        
-        for epoch in range(self.args.num_local_epoch):
-            epoch_loss = 0.0
-            
-            for inputs, labels in train_loader:
-                inputs, labels = inputs.to(self.device), labels.to(self.device)
-                
-                # Forward pass
-                outputs = client['model'](inputs)
-                loss = criterion(outputs, labels)
-                
-                # Backward pass
-                client['optimizer'].zero_grad()
-                loss.backward()
-                
-                # Apply SCAFFOLD control variates adjustment
-                for name, param in client['model'].named_parameters():
-                    if param.requires_grad and param.grad is not None:
-                        # Adjust gradient with control variate difference
-                        param.grad.data += c_global[name] - c_local[name]
-                
-                # Update model parameters
-                client['optimizer'].step()
-                
-                epoch_loss += loss.item()
-            
-            train_loss += epoch_loss / len(train_loader)
-        
-        # Calculate average training loss
-        train_loss /= self.args.num_local_epoch
-        
-        # Calculate model update (weight difference)
-        model_update = {}
-        for name, param in client['model'].state_dict().items():
-            if param.requires_grad:
-                model_update[name] = param.clone() - init_params[name]
-            else:
-                model_update[name] = torch.zeros_like(param)
-        
-        # Update client control variates
-        for name, param in client['model'].named_parameters():
-            if param.requires_grad:
-                # Update local control variate
-                c_local_new = c_local[name] - c_global[name] + (init_params[name] - param) / (self.args.num_local_epoch * client['optimizer'].param_groups[0]['lr'])
-                client['control_variate'][name] = c_local_new
-        
-        # Store client gradient for future use
-        if hasattr(self.args, 'use_historical_gradients') and self.args.use_historical_gradients:
-            self.client_gradients[client_id] = {k: v.clone() for k, v in model_update.items()}
-        
-        return model_update, train_loss 
-
-    def server_aggregate(self, updates):
-        """
-        Server aggregates client updates using weighted averaging
-        
-        Parameters:
-            updates: Dictionary of client updates, {client_id: (model_update, loss)}
-        
-        Returns:
-            avg_loss: Average client loss
-        """
-        n_clients = len(updates)
-        if n_clients == 0:
-            print("Warning: No client updates received for aggregation")
-            return 0.0
-        
-        # Extract losses and calculate weighted average
-        losses = [updates[client_id][1] for client_id in updates]
-        avg_loss = sum(losses) / n_clients
-        
-        # Second phase, if using historical gradients mechanism
-        if self.current_phase == 2 and hasattr(self.args, 'use_historical_gradients') and self.args.use_historical_gradients:
-            # Use historical gradients for non-selected clients
-            # Get list of selected and unselected clients
-            selected_clients = list(updates.keys())
-            all_clients = list(self.clients.keys())
-            # Filter out blacklisted clients
-            if hasattr(self, 'blacklisted_clients'):
-                unselected_clients = [c for c in all_clients if c not in selected_clients and c not in self.blacklisted_clients]
-            else:
-                unselected_clients = [c for c in all_clients if c not in selected_clients]
-            
-            round_factor = self.current_round - self.args.phase1_rounds  # Current round in phase 2
-            
-            # Use historical gradients only after certain rounds in phase 2
-            if round_factor >= 2:  # Start using historical gradients after 2 rounds in phase 2
-                updates_with_history = dict(updates)  # Create a copy of updates
-                history_count = 0
-                
-                for client_id in unselected_clients:
-                    # Check if client has historical gradients
-                    if client_id in self.client_gradients and self.client_gradients[client_id] is not None:
-                        # Calculate rounds since last selection
-                        rounds_passed = self.current_round - self.client_last_selected[client_id]
+                # 第一阶段：使用FedProx或SCAFFOLD算法
+                if phase == 1:
+                    if hasattr(self.args, 'scaffold_for_phase1') and self.args.scaffold_for_phase1:
+                        # 使用SCAFFOLD：不需要修改损失函数，但需要修改梯度
+                        pass
+                    else:
+                        # 使用FedProx：计算近端项（proximal term）
+                        proximal_term = 0.0
+                        for name, param in model.named_parameters():
+                            if name in global_params:
+                                proximal_term += torch.sum((param - global_params[name])**2)
                         
-                        if rounds_passed > 0:
-                            # Decay factor based on rounds passed since last selection
-                            decay_factor = max(0, 1.0 - (rounds_passed * self.gradient_decay / 10.0))
-                            
-                            # Only use historical gradient if decay factor is above threshold
-                            if decay_factor > self.gradient_threshold:
-                                # Scale historical gradient by decay factor
-                                scaled_gradient = {k: v * decay_factor for k, v in self.client_gradients[client_id].items()}
-                                
-                                # Add to updates with historical gradients
-                                updates_with_history[client_id] = (scaled_gradient, avg_loss)  # Use average loss for weighting
-                                history_count += 1
+                        # 添加近端项到损失函数
+                        loss += (mu / 2) * proximal_term
                 
-                if history_count > 0:
-                    print(f"Using {history_count} historical client gradients with decay {self.gradient_decay} (round {self.current_round}, phase 2)")
-                    # Use updated dictionary with historical gradients
-                    updates = updates_with_history
+                loss.backward()
+                
+                # SCAFFOLD: 第一阶段应用控制变量修正梯度
+                if phase == 1 and hasattr(self.args, 'scaffold_for_phase1') and self.args.scaffold_for_phase1:
+                    for name, param in model.named_parameters():
+                        if param.grad is not None and name in client_control and name in server_control:
+                            param.grad += server_control[name] - client_control[name]
+                
+                # 添加梯度裁剪以防止梯度爆炸和NaN值
+                max_norm = 10.0  # 最大梯度范数
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+                
+                # 检查并修复NaN梯度
+                for name, param in model.named_parameters():
+                    if param.grad is not None and torch.isnan(param.grad).any():
+                        print(f"警告: 客户端 {client_id} 在训练中出现NaN梯度，已将其置零")
+                        param.grad.data = torch.zeros_like(param.grad.data)
+                
+                optimizer.step()
+                batch_loss += loss.item()
+                batch_count += 1
+            
+            epoch_loss = batch_loss / len(train_loader)
         
-        # Extract model updates
-        client_updates = {client_id: updates[client_id][0] for client_id in updates}
+        # SCAFFOLD: 更新客户端控制变量（仅在第一阶段）
+        if phase == 1 and hasattr(self.args, 'scaffold_for_phase1') and self.args.scaffold_for_phase1:
+            for name, param in model.state_dict().items():
+                if name in client['control_variate'] and name in init_params:
+                    # 计算新的控制变量: c_i^{+} = c_i - c + (x_0 - x_K) / (K * eta)
+                    lr = self.args.learning_rate
+                    step_size = self.args.scaffold_c_lr / (self.args.num_local_epoch * lr)
+                    client['control_variate'][name] = old_client_control[name] - server_control[name] + (init_params[name] - param) * step_size
         
-        # Apply parameter updates to server model
-        with torch.no_grad():
-            if self.current_phase == 1 and hasattr(self.args, 'scaffold_for_phase1') and self.args.scaffold_for_phase1:
-                # Update server model with SCAFFOLD aggregation
-                self._server_aggregate_scaffold(client_updates)
+        # 收集模型权重
+        model_state = model.state_dict()
+        
+        # 在第二阶段只返回分类层的参数（可训练参数），减少通信开销
+        if phase == 2:
+            # 创建一个新的状态字典，只包含分类层参数
+            classifier_state = {}
+            for name, param in model.named_parameters():
+                if param.requires_grad:  # 只包含可训练的参数（分类层）
+                    classifier_state[name] = model_state[name]
+            
+            # 使用分类层状态代替完整模型状态
+            model_state = classifier_state
+        
+        # 保存当前轮次的梯度（用于梯度记录机制）
+        if phase == 2:  # 只在第二阶段记录梯度
+            # 检查客户端是否在黑名单中
+            if self.use_reputation and client_id in self.blacklisted_clients:
+                # 不为黑名单客户端存储梯度
+                return model_state, self.trainset_config['data_size'][idx], loss
+                
+            # 计算当前梯度：全局模型与本地更新后模型的差
+            client_gradient = {}
+            has_nan = False
+            
+            for name, param in model.named_parameters():
+                if name in self.server_model.state_dict() and param.requires_grad:
+                    server_param = self.server_model.state_dict()[name]
+                    # 梯度 = 服务器参数 - 客户端更新后参数
+                    grad = server_param - model_state[name]
+                    
+                    # 检查NaN值
+                    if torch.isnan(grad).any():
+                        print(f"警告: 客户端 {client_id} 的梯度包含NaN值，将不记录此梯度")
+                        has_nan = True
+                        break
+                    
+                    client_gradient[name] = grad
+            
+            # 只在没有NaN值时存储梯度
+            if not has_nan:
+                # 存储客户端梯度
+                self.client_gradients[client_id] = client_gradient
+                
+                # 更新最后选择轮次
+                self.client_last_selected[client_id] = self.current_round
             else:
-                # Update server model with FedAvg/FedProx aggregation
-                self._server_aggregate_fedavg(client_updates)
+                # 如果有NaN，确保清除该客户端的历史梯度
+                self.client_gradients[client_id] = None
         
-        return avg_loss
+        # 如果启用了投毒攻击且当前客户端是恶意客户端，执行梯度投毒攻击
+        if hasattr(self.args, 'enable_attack') and self.args.enable_attack:
+            # 从客户端ID中提取客户端编号
+            client_idx = -1
+            if isinstance(client_id, str) and client_id.startswith('client_'):
+                try:
+                    client_idx = int(client_id.split('_')[1])
+                except (IndexError, ValueError):
+                    # 尝试不同的格式
+                    try:
+                        client_idx = int(''.join(filter(str.isdigit, client_id)))
+                    except ValueError:
+                        print(f"无法从客户端ID {client_id} 提取编号")
+            
+            # 检查客户端是否是恶意客户端
+            if client_idx != -1 and client_idx < self.args.num_malicious:
+                print(f"客户端 {client_id} (索引 {client_idx}) 准备执行 {self.args.attack_type} 类型的梯度投毒攻击 (阶段 {phase})")
+                
+                # 获取并修改模型参数
+                attack_count = 0
+                for name, param in model_state.items():
+                    if name in self.server_model.state_dict():
+                        server_param = self.server_model.state_dict()[name]
+                        # 计算梯度（模型差异）
+                        gradient = server_param - param
+                        
+                        # 根据攻击类型修改梯度
+                        try:
+                            if self.args.attack_type == 'gaussian':
+                                # 增强gaussian攻击效果，使其更易被检测
+                                # 生成随机噪声
+                                noise = torch.randn_like(gradient)
+                                # 标准化噪声向量
+                                noise_norm = torch.norm(noise)
+                                if noise_norm > 0:
+                                    noise = noise / noise_norm
+                                # 缩放噪声至梯度范数的倍数
+                                gradient_norm = torch.norm(gradient)
+                                # 使用梯度范数和指定的噪声级别确定噪声大小
+                                scaling_factor = gradient_norm * max(self.args.noise_level, 3.0)
+                                # 添加缩放后的噪声
+                                noise = noise * scaling_factor
+                                print(f"Gaussian攻击: 梯度范数={gradient_norm:.4f}, 噪声范数={scaling_factor:.4f}")
+                                gradient = gradient + noise
+                            elif self.args.attack_type == 'sign_flip':
+                                # 翻转梯度符号，但避免极值
+                                gradient = -gradient * min(self.args.noise_level, 5.0)
+                            elif self.args.attack_type == 'targeted':
+                                # 目标攻击：将梯度朝固定方向偏移，但限制范围
+                                gradient = torch.ones_like(gradient).clamp(-5, 5) * min(self.args.noise_level, 5.0)
+                            
+                            # 检查修改后的梯度是否包含NaN
+                            if torch.isnan(gradient).any():
+                                print(f"警告: 攻击生成的梯度包含NaN值，将使用随机小值替代")
+                                gradient = torch.randn_like(gradient) * 0.01  # 使用小的随机值
+                            
+                            # 应用梯度修改，更新模型状态
+                            model_state[name] = server_param - gradient
+                            attack_count += 1
+                        except Exception as e:
+                            print(f"执行攻击时出错: {e}，跳过此层参数")
+                
+                print(f"客户端 {client_id} (索引 {client_idx}) 成功执行了 {self.args.attack_type} 类型的梯度投毒攻击，修改了 {attack_count} 层参数 (阶段 {phase})")
+        
+        return model_state, len(client['data']), epoch_loss
     
-    def _server_aggregate_fedavg(self, client_updates):
-        """FedAvg/FedProx aggregation method"""
-        n_clients = len(client_updates)
+    def server_aggregate(self, updates):
+        """带梯度记录的服务器聚合模型"""
+        total_weight = 0
+        aggregated_weights = None
         
-        # Create average model update dictionary
-        avg_update = {}
-        for name, param in self.server_model.state_dict().items():
-            updates_sum = torch.zeros_like(param)
-            for client_id in client_updates:
-                updates_sum += client_updates[client_id][name]
-            
-            # Compute average update
-            avg_update[name] = updates_sum / n_clients
-            
-            # Apply update to server model
-            param.add_(avg_update[name])
-    
-    def _server_aggregate_scaffold(self, client_updates):
-        """SCAFFOLD aggregation method with control variates update"""
-        n_clients = len(client_updates)
+        # 判断是否使用SCAFFOLD进行聚合
+        use_scaffold = hasattr(self.args, 'scaffold_for_phase1') and self.args.scaffold_for_phase1 and self.current_phase == 1
         
-        # Create average model update dictionary
-        avg_update = {}
-        for name, param in self.server_model.state_dict().items():
-            updates_sum = torch.zeros_like(param)
-            for client_id in client_updates:
-                updates_sum += client_updates[client_id][name]
-            
-            # Compute average update
-            avg_update[name] = updates_sum / n_clients
-            
-            # Apply update to server model
-            param.add_(avg_update[name])
+        # 选中客户端列表
+        selected_clients = list(updates.keys())
         
-        # Update server control variates
-        for client_id in client_updates:
-            for name in self.control_variate:
-                # Update global control variate with average of client control variates
-                self.control_variate[name] += (self.clients[client_id]['control_variate'][name] - self.control_variate[name]) / n_clients
+        # 在第二阶段使用历史梯度
+        if self.current_phase == 2:
+            # 第二阶段：只聚合分类层参数（不复制整个模型状态）
+            aggregated_weights = {}
+            
+            # 用于记录哪些层会被更新（分类层）
+            updated_layers = set()
+            
+            # 聚合选中客户端的更新（只聚合分类层）
+            for client_id, (weights, num_samples, _) in updates.items():
+                total_weight += num_samples
+                
+                # 处理客户端提供的层（这些应该全部是分类层）
+                for k in weights.keys():
+                    if k not in updated_layers:
+                        # 首次更新该层时初始化
+                        if k not in aggregated_weights:
+                            aggregated_weights[k] = torch.zeros_like(weights[k])
+                        updated_layers.add(k)
+                    
+                    # 加权累加
+                    aggregated_weights[k] += weights[k] * num_samples
+            
+            # 启用历史梯度虚拟聚合机制
+            if hasattr(self.args, 'use_historical_gradients') and self.args.use_historical_gradients:
+                # 获取未选中的客户端列表，并排除黑名单客户端
+                unselected_clients = [client_id for client_id in self.clients.keys() 
+                                     if client_id not in selected_clients 
+                                     and (not self.use_reputation or client_id not in self.blacklisted_clients)]
+                
+                # 为未选中的客户端添加历史梯度（如果有）
+                for client_id in unselected_clients:
+                    if self.client_gradients[client_id] is not None:
+                        # 计算衰减因子：基于轮次间隔的指数衰减
+                        rounds_since_selected = self.current_round - self.client_last_selected[client_id]
+                        decay_factor = self.gradient_decay ** rounds_since_selected
+                        
+                        # 只使用时间衰减加权，不考虑客户端数据量
+                        if decay_factor > self.gradient_threshold:  # 使用类的阈值成员变量
+                            # 使用统一的标准权重
+                            client_effective_weight = 1.0
+                            
+                            # 检查梯度是否包含NaN
+                            has_nan_grad = False
+                            for name, grad in self.client_gradients[client_id].items():
+                                if torch.isnan(grad).any():
+                                    has_nan_grad = True
+                                    print(f"警告: 客户端 {client_id} 的历史梯度包含NaN值，将跳过此梯度")
+                                    break
+                            
+                            # 如果梯度包含NaN，跳过此客户端
+                            if has_nan_grad:
+                                # 清除此客户端的历史梯度
+                                self.client_gradients[client_id] = None
+                                continue
+                            
+                            for name, grad in self.client_gradients[client_id].items():
+                                # 只处理分类层梯度（确保该层在聚合权重中）
+                                if name in updated_layers:
+                                    # 仅应用时间衰减，不乘以客户端数据量
+                                    weighted_grad = grad * client_effective_weight * decay_factor
+                                    # 添加到聚合权重中 (减去加权梯度，因为梯度 = 服务器参数 - 客户端参数)
+                                    aggregated_weights[name] -= weighted_grad
+                            
+                            # 添加到总权重中，考虑衰减但不考虑数据量
+                            total_weight += client_effective_weight * decay_factor
+                            
+                            if self.current_round % 20 == 0 and rounds_since_selected < 5:  # 只在特定轮次显示信息
+                                print(f"客户端 {client_id} 的历史梯度被加入聚合 (衰减因子: {decay_factor:.4f})")
+                                print(f"客户端 {client_id} 的历史梯度将继续保留用于后续轮次")
+            
+            # 计算加权平均（针对所有聚合的层）
+            for k in aggregated_weights.keys():
+                if total_weight > 0:
+                    aggregated_weights[k] = aggregated_weights[k] / total_weight
+            
+            # 仅在进入第二阶段时显示一次
+            if self.current_round == self.args.phase1_rounds:
+                print(f"第二阶段: 只聚合分类层参数 ({len(aggregated_weights)}个层)")
+                if len(aggregated_weights) > 0:
+                    for layer in list(aggregated_weights.keys())[:3]:
+                        print(f"  - {layer}: {aggregated_weights[layer].shape}")
+                    if len(aggregated_weights) > 3:
+                        print(f"  - ... 以及 {len(aggregated_weights)-3} 个其他层")
+            
+            return aggregated_weights
+        elif use_scaffold:
+            # SCAFFOLD聚合方式（第一阶段）
+            client_control_sum = {}
+            
+            for client_id, (weights, num_samples, _) in updates.items():
+                total_weight += num_samples
+                # 聚合模型权重
+                if aggregated_weights is None:
+                    aggregated_weights = {k: v.clone() * num_samples for k, v in weights.items()}
+                else:
+                    for k in weights.keys():
+                        aggregated_weights[k] += weights[k] * num_samples
+                
+                # 收集客户端控制变量用于更新服务器控制变量
+                client_control = self.clients[client_id]['control_variate']
+                if not client_control_sum:
+                    client_control_sum = {k: v.clone() * num_samples for k, v in client_control.items()}
+                else:
+                    for k in client_control.keys():
+                        client_control_sum[k] += client_control[k] * num_samples
+            
+            # 计算模型的加权平均
+            for k in aggregated_weights.keys():
+                aggregated_weights[k] = aggregated_weights[k] / total_weight
+                
+            # 更新服务器控制变量: c = (1/n) * sum(c_i)
+            for k in client_control_sum.keys():
+                self.control_variate[k] = client_control_sum[k] / total_weight
+            
+            return aggregated_weights
+        else:
+            # 标准FedAvg聚合方式（针对第一阶段或非特殊情况）
+            for client_id, (weights, num_samples, _) in updates.items():
+                total_weight += num_samples
+                if aggregated_weights is None:
+                    aggregated_weights = {k: v.clone() * num_samples for k, v in weights.items()}
+                else:
+                    for k in weights.keys():
+                        aggregated_weights[k] += weights[k] * num_samples
+            
+            # 计算加权平均
+            for k in aggregated_weights.keys():
+                aggregated_weights[k] = aggregated_weights[k] / total_weight
+            
+            return aggregated_weights
     
     def evaluate(self):
-        """
-        Evaluate server model on test data
-        
-        Returns:
-            accuracy: Test accuracy
-            f1: F1 score
-        """
+        """评估服务器模型性能"""
         self.server_model.eval()
         correct = 0
         total = 0
@@ -604,394 +643,518 @@ class FedCVG:
         all_targets = []
         
         with torch.no_grad():
-            for inputs, targets in self.test_loader:
-                inputs, targets = inputs.to(self.device), targets.to(self.device)
-                outputs = self.server_model(inputs)
-                _, predicted = outputs.max(1)
+            for data, target in self.test_loader:
+                data, target = data.to(self.device), target.to(self.device)
+                outputs = self.server_model(data)
+                _, predicted = torch.max(outputs.data, 1)
+                total += target.size(0)
+                correct += (predicted == target).sum().item()
                 
-                total += targets.size(0)
-                correct += predicted.eq(targets).sum().item()
-                
-                # Store predictions and targets for F1 score calculation
+                # 收集预测和目标值用于计算F1-score
                 all_preds.extend(predicted.cpu().numpy())
-                all_targets.extend(targets.cpu().numpy())
+                all_targets.extend(target.cpu().numpy())
         
-        accuracy = correct / total
+        # 计算F1-score (多分类使用macro平均)
         f1 = f1_score(all_targets, all_preds, average='macro')
         
-        return accuracy, f1
+        return correct / total, f1
     
     def detect_malicious_clients(self, updates):
         """
-        Detect potentially malicious clients using clustering
+        使用聚类分析检测恶意客户端
         
-        Parameters:
-            updates: Dictionary of client updates, {client_id: (model_update, loss)}
+        参数:
+        - updates: 客户端更新字典，格式为 {client_id: (weights, num_samples, loss)}
         
-        Returns:
-            malicious_clients: List of potentially malicious client IDs
+        返回:
+        - malicious_clients: 检测到的恶意客户端列表
         """
-        # If clustering is not enabled, return empty list
-        if not self.use_clustering:
+        if not self.use_clustering or self.current_phase != 1:
             return []
         
-        malicious_clients = []
+        # 提取所有客户端的更新
+        client_weights = {}
+        client_sample_sizes = {}
+        
+        for client_id, (weights, num_samples, _) in updates.items():
+            client_weights[client_id] = weights
+            client_sample_sizes[client_id] = num_samples
+        
+        # 转换模型参数为向量表示，用于聚类分析
+        weight_vectors = {}
+        client_ids = []
+        
+        # 特殊处理 - 计算与服务器模型的相对变化
+        for client_id, weights in client_weights.items():
+            vector = []
+            # 计算与服务器模型的差异
+            for name, param in weights.items():
+                if name in self.server_model.state_dict():
+                    server_param = self.server_model.state_dict()[name]
+                    diff = server_param - param  # 计算差异
+                    vector.append(diff.view(-1))
+            if vector:  # 确保有差异向量
+                weight_vectors[client_id] = torch.cat(vector).cpu().numpy()
+                client_ids.append(client_id)
+        
+        # 将更新向量堆叠为矩阵，每行代表一个客户端的更新
+        X = np.array([weight_vectors[client_id] for client_id in client_ids])
+        
+        # 客户端数量检查
+        num_clients = len(client_ids)
+        if num_clients < 3:  # 至少需要3个客户端才能进行有效聚类
+            return []
+        
+        # 检查并处理NaN值
+        if np.isnan(X).any():
+            print(f"警告: 检测到包含NaN值的客户端更新，正在进行处理...")
+            
+            # 检查每个客户端的更新是否包含NaN
+            nan_clients = []
+            for i, client_id in enumerate(client_ids):
+                if np.isnan(X[i]).any():
+                    nan_clients.append(client_id)
+                    print(f"客户端 {client_id} 的更新包含NaN值")
+            
+            # 如果所有客户端都有NaN，则无法进行聚类
+            if len(nan_clients) == num_clients:
+                print("错误: 所有客户端更新都包含NaN值，无法进行聚类分析")
+                return nan_clients  # 将所有NaN客户端视为恶意
+            
+            # 处理方法1: 移除包含NaN的客户端
+            valid_indices = ~np.isnan(X).any(axis=1)
+            X = X[valid_indices]
+            valid_client_ids = [client_ids[i] for i, valid in enumerate(valid_indices) if valid]
+            
+            # 如果剩余客户端太少，无法进行聚类
+            if len(valid_client_ids) < 3:
+                print(f"警告: 移除NaN后仅剩 {len(valid_client_ids)} 个有效客户端，直接将包含NaN的客户端标记为恶意")
+                return nan_clients
+            
+            print(f"已移除 {len(nan_clients)} 个包含NaN的客户端，使用剩余 {len(valid_client_ids)} 个客户端进行聚类")
+            client_ids = valid_client_ids
+        
+        # 确定聚类数量 - 增加聚类数量以更好地检测恶意客户端
+        n_clusters = min(max(self.args.fedhyb_cluster_count, 3), len(client_ids) - 1)
         
         try:
-            # Extract client IDs and model updates
-            client_ids = list(updates.keys())
+            # 计算更新向量的范数 - 用于检测异常梯度
+            norms = np.linalg.norm(X, axis=1)
+            mean_norm = np.mean(norms)
+            std_norm = np.std(norms)
             
-            if len(client_ids) <= 2:
-                print("Too few clients for clustering analysis")
-                return []
+            # 直接基于范数检测异常值
+            norm_threshold = mean_norm + 2 * std_norm  # 使用2倍标准差作为阈值
+            outlier_clients = []
             
-            # Flatten model updates for each client into 1D vectors for clustering
-            flattened_updates = []
+            # 特别针对高斯噪声攻击的检测
+            for i, client_id in enumerate(client_ids):
+                if norms[i] > norm_threshold:
+                    print(f"范数检测: 客户端 {client_id} 的梯度范数 {norms[i]:.4f} 超过阈值 {norm_threshold:.4f}")
+                    outlier_clients.append(client_id)
             
-            for client_id in client_ids:
-                # Extract model update
-                model_update = updates[client_id][0]
-                
-                # Flatten update into 1D vector
-                flat_update = []
-                for name, param in model_update.items():
-                    if 'num_batches_tracked' not in name:  # Skip batch norm tracking parameters
-                        flat_update.append(param.cpu().reshape(-1))
-                
-                flat_update = torch.cat(flat_update)
-                flattened_updates.append(flat_update.numpy())
-            
-            # Convert to numpy array for clustering
-            X = np.array(flattened_updates)
-            
-            # Normalize updates to unit norm
-            norms = np.linalg.norm(X, axis=1, keepdims=True)
-            norms[norms == 0] = 1  # Avoid division by zero
-            X_normalized = X / norms
-            
-            # Use KMeans for clustering
-            # Determine number of clusters based on configuration, but ensure reasonable values
-            # We want at most num_clients/2 clusters, and at least 2 clusters
-            n_clusters = min(max(self.args.fedhyb_cluster_count, 3), len(client_ids) - 1)
-            kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto").fit(X_normalized)
-            
-            # Get cluster labels and calculate cluster sizes
+            # 执行K-means聚类
+            kmeans = KMeans(n_clusters=n_clusters, n_init=10, random_state=self.args.i_seed).fit(X)
             labels = kmeans.labels_
-            cluster_sizes = {}
-            for i in range(n_clusters):
-                cluster_sizes[i] = np.sum(labels == i)
-            
-            # Calculate pairwise distances between cluster centers
             centers = kmeans.cluster_centers_
-            distances = pairwise_distances(centers)
             
-            # For each cluster, find its minimum distance to any other cluster
-            min_distances = {}
-            for i in range(n_clusters):
-                # Set diagonal to infinity to ignore self-distance
-                dist_row = distances[i].copy()
-                dist_row[i] = float('inf')
-                min_distances[i] = np.min(dist_row)
+            # 计算每个簇的大小
+            cluster_sizes = {}
+            for label in labels:
+                if label not in cluster_sizes:
+                    cluster_sizes[label] = 0
+                cluster_sizes[label] += 1
             
-            # Identify potential malicious clusters based on size and distance
-            malicious_clusters = []
+            # 计算簇之间的距离
+            cluster_distances = pairwise_distances(centers)
             
-            # Threshold for cluster size as a proportion of total clients
+            # 降低大小阈值，使更小的簇能被识别为恶意
             size_threshold = min(self.args.fedhyb_size_threshold, 0.25)
+            
+            # 标识可能的恶意簇
+            malicious_clusters = set()
             for i in range(n_clusters):
+                # 计算簇大小比例
                 size_ratio = cluster_sizes[i] / len(client_ids)
                 
-                # A small cluster that is far from others may be malicious
-                if size_ratio < size_threshold:
-                    # Adjust distance threshold based on empirical factors
+                # 判断是否是小簇（可能的恶意簇）
+                is_small_cluster = size_ratio < size_threshold
+                
+                # 计算与其他簇的最小距离
+                other_clusters = [j for j in range(n_clusters) if j != i]
+                if other_clusters:
+                    min_distance = min(cluster_distances[i][j] for j in other_clusters)
+                    # 判断是否距离远离其他簇（可能的恶意簇）
+                    # 降低距离阈值，使更近的簇也能被识别为异常
                     distance_threshold = self.args.fedhyb_distance_threshold * 0.75
-                    
-                    # If the cluster is small and far from others, mark it as suspicious
-                    min_distance = min_distances[i]
-                    if min_distance > distance_threshold:
-                        malicious_clusters.append(i)
-                        print(f"FedCVG clustering detected potential malicious cluster: cluster {i}, size={cluster_sizes[i]}/{len(client_ids)}, ratio={size_ratio:.2f}, min distance={min_distance:.4f}")
+                    is_distant_cluster = min_distance > distance_threshold
+                else:
+                    is_distant_cluster = False
+                
+                # 如果簇较小，则标记为可能的恶意簇
+                if is_small_cluster:
+                    malicious_clusters.add(i)
+                    print(f"FedHyb聚类检测到可能的恶意簇: 簇{i}, 大小={cluster_sizes[i]}/{len(client_ids)}, 比例={size_ratio:.2f}, 最小距离={min_distance:.4f}")
             
-            # Map cluster indices to client IDs
+            # 收集被标记为恶意簇的客户端
+            malicious_clients = []
             for i, label in enumerate(labels):
                 if label in malicious_clusters:
                     malicious_clients.append(client_ids[i])
             
-            # Report results
+            # 添加基于范数检测的异常客户端
+            for client_id in outlier_clients:
+                if client_id not in malicious_clients:
+                    malicious_clients.append(client_id)
+                    print(f"基于范数检测将客户端 {client_id} 标记为恶意")
+            
+            # 添加之前识别出的包含NaN的客户端
+            if 'nan_clients' in locals() and nan_clients:
+                print(f"将 {len(nan_clients)} 个包含NaN值的客户端标记为恶意")
+                malicious_clients.extend(nan_clients)
+            
             if malicious_clients:
-                print(f"FedCVG round {self.current_round+1} detected {len(malicious_clients)} potential malicious clients: {malicious_clients}")
+                print(f"FedHyb第{self.current_round+1}轮检测到{len(malicious_clients)}个可能的恶意客户端: {malicious_clients}")
             
             return malicious_clients
             
         except Exception as e:
-            print(f"Error during FedCVG clustering analysis: {e}")
-            return [] 
-
+            print(f"FedHyb聚类分析过程中出错: {e}")
+            # 如果聚类失败，将包含NaN的客户端标记为恶意
+            if 'nan_clients' in locals() and nan_clients:
+                print(f"聚类失败，将 {len(nan_clients)} 个包含NaN值的客户端标记为恶意")
+                return nan_clients
+            return []
+    
     def update_reputation(self, malicious_clients):
         """
-        Update reputation scores for clients based on clustering results
+        更新客户端信誉系统
         
-        Parameters:
-            malicious_clients: List of client IDs detected as potentially malicious
-            
-        Returns:
-            blacklisted_clients: Set of client IDs that should be excluded from training
+        参数:
+        - malicious_clients: 当前轮次检测到的恶意客户端列表
         """
-        # If reputation system not enabled, return empty set
-        if not self.use_reputation:
-            return set()
+        if not self.use_reputation or self.current_phase != 1:
+            return
         
-        # Update malicious counts for detected clients
+        # 更新被检测为恶意的客户端计数
         for client_id in malicious_clients:
-            if client_id in self.malicious_counts:
-                self.malicious_counts[client_id] += 1
-                
-                # Check if client should be permanently blacklisted
-                if self.malicious_counts[client_id] > self.reputation_threshold:
-                    self.blacklisted_clients.add(client_id)
-                    print(f"Client {client_id} has been permanently blacklisted (detected malicious {self.malicious_counts[client_id]} times)")
-        
-        # Report current blacklist status
-        if self.blacklisted_clients:
-            print(f"Currently blacklisted clients: {self.blacklisted_clients}")
+            self.malicious_counts[client_id] += 1
             
-        return self.blacklisted_clients
+            # 如果被标记为恶意的次数超过阈值，加入黑名单
+            if self.malicious_counts[client_id] >= self.reputation_threshold:
+                if client_id not in self.blacklisted_clients:
+                    self.blacklisted_clients.add(client_id)
+                    print(f"客户端 {client_id} 被标记为恶意客户端 {self.malicious_counts[client_id]}/{self.reputation_threshold:.1f} 次，已加入黑名单")
+        
+        # 每10轮显示一次当前的信誉状态
+        if self.current_round % 10 == 0:
+            # 按恶意计数排序的客户端列表
+            sorted_clients = sorted(self.malicious_counts.items(), key=lambda x: x[1], reverse=True)
+            print("\n当前客户端信誉状态:")
+            print(f"{'客户端ID':<10} | {'恶意计数':<10} | {'状态':<10}")
+            print("-" * 35)
+            
+            for client_id, count in sorted_clients[:5]:  # 只显示前5个
+                if count > 0:
+                    status = "黑名单" if client_id in self.blacklisted_clients else "正常"
+                    print(f"{client_id:<10} | {count:<10} | {status:<10}")
+            
+            if len(self.blacklisted_clients) > 0:
+                print(f"\n当前黑名单客户端: {self.blacklisted_clients}")
     
     def select_clients(self, client_ratio):
-        """
-        Select a subset of clients for the current round
+        """根据客户端比例随机选择参与训练的客户端，排除黑名单客户端"""
+        all_clients = self.trainset_config['users']
         
-        Parameters:
-            client_ratio: Ratio of clients to select
-            
-        Returns:
-            selected_clients: List of selected client IDs
-        """
-        # Determine available clients (excluding blacklisted ones)
-        available_clients = [c for c in self.clients.keys() if c not in self.blacklisted_clients]
+        # 在任何阶段都排除黑名单客户端，只要启用信誉机制
+        if self.use_reputation and self.blacklisted_clients:
+            eligible_clients = [client_id for client_id in all_clients if client_id not in self.blacklisted_clients]
+            if not eligible_clients:  # 如果所有客户端都被拉黑（极少情况），使用所有客户端
+                print("警告: 所有客户端都在黑名单中，将使用所有客户端")
+                eligible_clients = all_clients
+        else:
+            eligible_clients = all_clients
         
-        # Calculate number of clients to select
-        n_select = max(1, int(client_ratio * len(available_clients)))
-        
-        # Randomly select clients
-        selected_clients = np.random.choice(available_clients, n_select, replace=False).tolist()
-        
-        # Update last selection round for selected clients
-        for client_id in selected_clients:
-            self.client_last_selected[client_id] = self.current_round
-            
+        num_selected = max(1, int(len(eligible_clients) * client_ratio))
+        selected_clients = random.sample(eligible_clients, num_selected)
         return selected_clients
     
     def update_model_partial(self, client_model, server_weights, phase):
         """
-        Update only a portion of the model weights (for phase 2, only update classification layers)
+        根据当前阶段选择性地更新客户端模型参数
         
-        Parameters:
-            client_model: Client model instance
-            server_weights: Server model state_dict
-            phase: Current training phase
-            
-        Returns:
-            None, updates client_model in-place
+        参数:
+            client_model: 客户端模型
+            server_weights: 服务器模型权重
+            phase: 当前阶段(1或2)
         """
-        # Determine which parameters to update based on phase
+        client_weights = client_model.state_dict()
+        
         if phase == 1:
-            # In phase 1, update all parameters
-            with torch.no_grad():
-                for name, param in client_model.state_dict().items():
-                    param.copy_(server_weights[name])
+            # 第一阶段: 更新全部参数
+            client_model.load_state_dict(server_weights)
         else:
-            # In phase 2, only update classification layer parameters
-            model_name = client_model.__class__.__name__
+            # 第二阶段: 只更新分类层参数，保持特征提取层冻结
+            for name, param in client_model.named_parameters():
+                if param.requires_grad and name in server_weights:
+                    client_weights[name] = server_weights[name]
             
-            # Define classification layer names for different models
-            if 'LeNet' in model_name:
-                classifier_layers = ['fc1', 'fc2', 'fc3'] 
-            elif 'CNN' in model_name:
-                classifier_layers = ['fc1', 'fc2']
-            elif 'ResNet' in model_name:
-                classifier_layers = ['linear']
-            elif 'AlexCifarNet' in model_name:
-                classifier_layers = ['classifier']
-            else:
-                # Default: assume last 30% of parameters are classification layers
-                all_params = list(client_model.state_dict().keys())
-                split_idx = int(len(all_params) * 0.7)
-                classifier_layers = all_params[split_idx:]
-            
-            # Update only classification layer parameters
-            with torch.no_grad():
-                for name, param in client_model.state_dict().items():
-                    if any(layer in name for layer in classifier_layers):
-                        param.copy_(server_weights[name])
+            client_model.load_state_dict(client_weights)
     
     def save_results(self):
-        """Save training results to a file"""
-        # Create result filename based on algorithm configuration
-        attack_suffix = f"_attack_{self.args.attack_type}_{self.args.num_malicious}" if self.args.enable_attack else ""
-        algo_suffix = '_clust' if self.use_clustering else ''
-        
-        if hasattr(self.args, 'scaffold_for_phase1') and self.args.scaffold_for_phase1:
-            phase1_algo = 'SCAFFOLD'
-        else:
-            phase1_algo = 'FedProx'
+        """保存训练结果到文件"""
+        try:
+            # 确保结果目录存在
+            if not os.path.exists(self.args.res_root):
+                os.makedirs(self.args.res_root)
+                print(f"创建结果目录: {self.args.res_root}")
             
-        phase2_suffix = '_hist' if hasattr(self.args, 'use_historical_gradients') and self.args.use_historical_gradients else ''
-        
-        filename = f'[FedCVG_{phase1_algo}{algo_suffix}{phase2_suffix}_{self.args.model}_non_iid_label_alpha{self.args.alpha}_{self.args.i_seed}]{attack_suffix}'
-        
-        # Prepare results data for saving
-        results_dict = {
-            'args': vars(self.args),
-            'results': self.results,
-            'blacklisted_clients': list(self.blacklisted_clients) if hasattr(self, 'blacklisted_clients') else [],
-            'malicious_counts': self.malicious_counts if hasattr(self, 'malicious_counts') else {}
-        }
-        
-        # Create backup directory if it doesn't exist
-        backup_path = os.path.join(self.args.res_root, f'fedcvg_results_backup_{self.args.i_seed}')
-        if not os.path.exists(backup_path):
-            os.makedirs(backup_path)
+            # 修改文件名以匹配其他算法的格式
+            phase1_algo = "SCAFFOLD" if (hasattr(self.args, 'scaffold_for_phase1') and self.args.scaffold_for_phase1) else "FedProx"
             
-        # Save to backup location first (to prevent data loss in case of crash)
-        backup_file = os.path.join(backup_path, f"{filename}.json")
-        with open(backup_file, 'w') as f:
-            json.dump(results_dict, f, cls=PythonObjectEncoder, indent=4)
+            # 添加附加功能到名称
+            algo_suffix = ""
+            if self.use_clustering:
+                algo_suffix += "_Cluster"
+            if self.use_reputation:
+                algo_suffix += "_Rep"
             
-        # Then save to main results directory
-        file_path = os.path.join(self.args.res_root, f"{filename}.json")
-        with open(file_path, 'w') as f:
-            json.dump(results_dict, f, cls=PythonObjectEncoder, indent=4)
+            phase2_suffix = "_GradMem" if (hasattr(self.args, 'use_historical_gradients') and self.args.use_historical_gradients) else ""
             
-        return file_path
+            # 添加攻击信息到文件名
+            attack_suffix = ""
+            if hasattr(self.args, 'enable_attack') and self.args.enable_attack:
+                attack_suffix = f"_attack_{self.args.attack_type}_{self.args.num_malicious}_{self.args.noise_level}"
+            
+            # 使用与其他算法相同的文件命名格式，移除.json扩展名
+            filename = f'[FedHyb_{phase1_algo}{algo_suffix}{phase2_suffix}_{self.args.model}_non_iid_label_alpha{self.args.alpha}_{self.args.i_seed}]{attack_suffix}'
+            result_path = os.path.join(self.args.res_root, filename)
+            
+            # 检查results字典是否为空
+            if not self.results or not self.results.get('server') or not self.results['server'].get('accuracy'):
+                print("警告: 结果数据为空，无法保存结果")
+                return
+            
+            # 确保结果包含正确的数据
+            print(f"准备保存结果数据...")
+            print(f"- 准确率记录: {len(self.results['server']['accuracy'])}项")
+            print(f"- 损失记录: {len(self.results['server']['train_loss'])}项")
+            print(f"- F1分数记录: {len(self.results['server']['f1_score'])}项")
+            
+            # 使用json.dump保存结果
+            with open(result_path, 'w') as f:
+                json.dump(self.results, f, cls=PythonObjectEncoder)
+            
+            # 验证文件是否成功保存
+            if os.path.exists(result_path):
+                file_size = os.path.getsize(result_path)
+                print(f"结果已成功保存到: {result_path} (文件大小: {file_size/1024:.2f} KB)")
+            else:
+                print(f"错误: 文件保存失败，找不到文件: {result_path}")
+                
+        except Exception as e:
+            print(f"保存结果时发生错误: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            
+            # 尝试备用保存方式
+            try:
+                backup_path = os.path.join(self.args.res_root, f'fedhyb_results_backup_{self.args.i_seed}')
+                with open(backup_path, 'w') as f:
+                    json.dump(self.results, f, cls=PythonObjectEncoder)
+                print(f"已创建备份结果文件: {backup_path}")
+            except Exception as backup_err:
+                print(f"备份保存也失败: {str(backup_err)}")
     
     def train(self):
-        """
-        FedCVG training process
+        """FedHyb训练过程"""
+        pbar = tqdm(range(self.args.total_rounds))
+        max_accuracy = 0
+        max_f1 = 0
         
-        Returns:
-            results: Dictionary of training results
-        """
-        # Set up progress tracking
+        # 输出算法信息
         if hasattr(self.args, 'scaffold_for_phase1') and self.args.scaffold_for_phase1:
-            print("=== FedCVG (SCAFFOLD -> FedAvg) Training Started ===")
+            print("=== FedHyb (SCAFFOLD -> FedAvg) 训练开始 ===")
+            print(f"第一阶段 (1-{self.args.phase1_rounds}轮): SCAFFOLD算法，学习率: {self.args.learning_rate}")
+            print(f"SCAFFOLD控制变量学习率: {self.args.scaffold_c_lr}")
         else:
-            print("=== FedCVG (FedProx -> FedAvg) Training Started ===")
-            
-        # Track current round and phase
-        self.current_round = 0
-        self.current_phase = 1
+            print("=== FedHyb (FedProx -> FedAvg) 训练开始 ===")
+            print(f"第一阶段 (1-{self.args.phase1_rounds}轮): FedProx算法，学习率: {self.args.learning_rate}")
+            print(f"FedProx近端项系数: {self.args.fedprox_mu}")
         
-        # Phase 1 Training
-        print("\nPhase 1 - Feature Extraction Training:")
-        for round_idx in range(self.args.phase1_rounds):
+        # 显示是否启用梯度记录
+        use_historical = hasattr(self.args, 'use_historical_gradients') and self.args.use_historical_gradients
+        if use_historical:
+            print(f"第二阶段 ({self.args.phase1_rounds+1}-{self.args.total_rounds}轮): 增强型FedAvg(带梯度记录)，学习率: {self.args.phase2_learning_rate}")
+            print(f"梯度衰减系数: {self.gradient_decay}")
+        else:
+            print(f"第二阶段 ({self.args.phase1_rounds+1}-{self.args.total_rounds}轮): FedAvg算法，学习率: {self.args.phase2_learning_rate}")
+        
+        # 打印特征提取层冻结信息（在进入第二阶段时会有更详细的信息）
+        print(f"第二阶段: 冻结特征提取层，只训练分类层")
+        
+        for round_idx in pbar:
+            # 保存当前轮次
             self.current_round = round_idx
             
-            # Select clients for this round
-            selected_clients = self.select_clients(self.args.phase1_client_ratio)
+            # 确定当前阶段
+            if round_idx < self.args.phase1_rounds:
+                self.current_phase = 1
+                # 使用客户端比例
+                client_ratio = self.args.phase1_client_ratio
+            else:
+                # 如果是第一轮第二阶段的训练，清除黑名单客户端的历史梯度
+                if round_idx == self.args.phase1_rounds:
+                    self.current_phase = 2
+                    # 清除黑名单客户端的历史梯度
+                    if self.use_reputation and self.blacklisted_clients:
+                        print(f"\n第二阶段开始：清除 {len(self.blacklisted_clients)} 个黑名单客户端的历史梯度")
+                        for client_id in self.blacklisted_clients:
+                            if client_id in self.client_gradients:
+                                self.client_gradients[client_id] = None
+                                print(f"已清除客户端 {client_id} 的历史梯度")
+                else:
+                    self.current_phase = 2
+                # 使用客户端比例
+                client_ratio = self.args.phase2_client_ratio
             
-            # Print round info
-            print(f"\nRound {round_idx+1}/{self.args.total_rounds} (Phase 1): {len(selected_clients)} clients selected")
+            # 选择客户端
+            selected_clients = self.select_clients(client_ratio)
             
-            # Client update
+            # 客户端本地训练
             client_updates = {}
-            for client_id in tqdm(selected_clients, desc="Client Training"):
-                # Skip if client in blacklist
-                if hasattr(self, 'blacklisted_clients') and client_id in self.blacklisted_clients:
-                    continue
-                    
-                # Perform client update
-                update, loss = self.client_update(client_id, phase=1)
-                client_updates[client_id] = (update, loss)
+            for client_id in selected_clients:
+                # 更新客户端模型（根据阶段决定是全部更新还是部分更新）
+                self.update_model_partial(self.clients[client_id]['model'], self.server_model.state_dict(), self.current_phase)
+                
+                # 本地训练
+                weights, num_samples, loss = self.client_update(client_id, phase=self.current_phase)
+                client_updates[client_id] = (weights, num_samples, loss)
             
-            # Detect malicious clients (if clustering enabled)
-            if self.use_clustering:
+            # 在第一阶段启用聚类检测和信誉机制
+            if self.current_phase == 1 and (self.use_clustering or self.use_reputation):
+                # 检测恶意客户端
                 malicious_clients = self.detect_malicious_clients(client_updates)
                 
-                # Remove malicious clients from updates
-                for client_id in malicious_clients:
-                    if client_id in client_updates:
-                        del client_updates[client_id]
-                
-                # Update reputation scores
+                # 更新客户端信誉
                 if self.use_reputation:
                     self.update_reputation(malicious_clients)
-            
-            # Server aggregation
-            avg_loss = self.server_aggregate(client_updates)
-            
-            # Evaluate model
-            accuracy, f1 = self.evaluate()
-            
-            # Record results
-            self.results['server']['accuracy'].append(accuracy)
-            self.results['server']['train_loss'].append(avg_loss)
-            self.results['server']['f1_score'].append(f1)
-            self.results['server']['phase'].append(1)
-            
-            # Print progress
-            print(f"Round {round_idx+1} - Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}, F1 Score: {f1:.4f}")
-            
-            # Save intermediate results every 10 rounds
-            if (round_idx + 1) % 10 == 0 or round_idx == self.args.phase1_rounds - 1:
-                self.save_results()
-        
-        # Transition to Phase 2
-        self.current_phase = 2
-        print("\nPhase 2 - Classification Layer Training:")
-        
-        # For each round in phase 2
-        for round_idx in range(self.args.phase1_rounds, self.args.total_rounds):
-            self.current_round = round_idx
-            
-            # Select clients for this round
-            selected_clients = self.select_clients(self.args.phase2_client_ratio)
-            
-            # Print round info
-            print(f"\nRound {round_idx+1}/{self.args.total_rounds} (Phase 2): {len(selected_clients)} clients selected")
-            
-            # Client update
-            client_updates = {}
-            for client_id in tqdm(selected_clients, desc="Client Training"):
-                # Skip if client in blacklist
-                if hasattr(self, 'blacklisted_clients') and client_id in self.blacklisted_clients:
-                    continue
+                
+                # 如果检测到恶意客户端，从更新中移除（但保留在信誉系统中的记录）
+                if malicious_clients:
+                    print(f"第{self.current_round+1}轮: 从聚合中排除 {len(malicious_clients)} 个恶意客户端")
+                    for client_id in malicious_clients:
+                        if client_id in client_updates:
+                            del client_updates[client_id]
+                            print(f"  - 已排除客户端 {client_id}")
                     
-                # Perform client update
-                update, loss = self.client_update(client_id, phase=2)
-                client_updates[client_id] = (update, loss)
+                    if len(client_updates) == 0:
+                        print("警告: 所有参与的客户端都被检测为恶意，恢复使用所有客户端")
+                        client_updates = {}
+                        for client_id in selected_clients:
+                            weights, num_samples, loss = self.client_update(client_id, phase=self.current_phase)
+                            client_updates[client_id] = (weights, num_samples, loss)
             
-            # Server aggregation
-            avg_loss = self.server_aggregate(client_updates)
+            # 服务器聚合
+            aggregated_weights = self.server_aggregate(client_updates)
             
-            # Evaluate model
+            # 检查聚合权重是否包含NaN
+            has_nan_weights = False
+            if aggregated_weights:
+                for k in aggregated_weights:
+                    if torch.isnan(aggregated_weights[k]).any():
+                        print(f"警告: 聚合后的权重包含NaN值，将跳过此次更新")
+                        has_nan_weights = True
+                        break
+            
+            # 仅在没有NaN时更新服务器模型
+            if not has_nan_weights and aggregated_weights:
+                # 更新服务器模型
+                if self.current_phase == 2:
+                    # 第二阶段：仅更新分类层参数
+                    current_state = self.server_model.state_dict()
+                    for k in aggregated_weights:
+                        if k in current_state:
+                            current_state[k] = aggregated_weights[k]
+                    self.server_model.load_state_dict(current_state)
+                else:
+                    # 第一阶段：更新整个模型
+                    self.server_model.load_state_dict(aggregated_weights)
+            
+            # 评估
             accuracy, f1 = self.evaluate()
+            avg_loss = sum(update[2] for update in client_updates.values()) / len(client_updates) if client_updates else 0
             
-            # Record results
+            # 记录结果
             self.results['server']['accuracy'].append(accuracy)
             self.results['server']['train_loss'].append(avg_loss)
             self.results['server']['f1_score'].append(f1)
-            self.results['server']['phase'].append(2)
+            self.results['server']['phase'].append(self.current_phase)
             
-            # Print progress
-            print(f"Round {round_idx+1} - Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}, F1 Score: {f1:.4f}")
+            if accuracy > max_accuracy:
+                max_accuracy = accuracy
+            if f1 > max_f1:
+                max_f1 = f1
             
-            # Save intermediate results every 10 rounds
-            if (round_idx + 1) % 10 == 0 or round_idx == self.args.total_rounds - 1:
-                self.save_results()
+            # 显示当前使用的算法
+            algorithm_name = ""
+            if self.current_phase == 1:
+                algorithm_name = "SCAFFOLD" if (hasattr(self.args, 'scaffold_for_phase1') and self.args.scaffold_for_phase1) else "FedProx"
+                if self.use_clustering:
+                    algorithm_name += "+聚类"
+                if self.use_reputation:
+                    algorithm_name += "+信誉机制"
+            else:
+                algorithm_name = "增强型FedAvg(带梯度记录)" if use_historical else "FedAvg"
+            
+            # 添加客户端选择信息
+            client_info = f'选中: {len(selected_clients)}/{len(self.trainset_config["users"])}'
+            if self.current_phase == 1 and self.use_reputation and self.blacklisted_clients:
+                client_info += f' (黑名单: {len(self.blacklisted_clients)})'
+                
+            if self.current_phase == 2 and use_historical and self.current_round % 10 == 0:  # 每10轮才显示历史梯度信息
+                # 计算有效参与的未选中客户端数量，排除黑名单客户端
+                effective_unselected = 0
+                for client_id in self.trainset_config["users"]:
+                    if client_id not in selected_clients and self.client_gradients.get(client_id) is not None:
+                        # 检查客户端是否在黑名单中
+                        if self.use_reputation and client_id in self.blacklisted_clients:
+                            continue
+                        rounds_since = self.current_round - self.client_last_selected[client_id]
+                        if self.gradient_decay ** rounds_since > 0.01:
+                            effective_unselected += 1
+                
+                if effective_unselected > 0:
+                    client_info += f' (历史梯度: +{effective_unselected})'
+                
+                # 在第二阶段也显示黑名单信息
+                if self.use_reputation and self.blacklisted_clients:
+                    client_info += f' (黑名单: {len(self.blacklisted_clients)})'
+            
+            # 更新进度条信息
+            pbar.set_description(
+                f"轮次: {round_idx+1}/{self.args.total_rounds} | "
+                f"阶段: {self.current_phase} | "
+                f"算法: {algorithm_name} | "
+                f"准确率: {accuracy:.4f} | "
+                f"F1: {f1:.4f} | "
+                f"{client_info}"
+            )
         
-        # Save final results
-        result_file = self.save_results()
-        print(f"\nFedCVG training completed")
-        print(f"Final results saved to: {result_file}")
+        # 保存最终结果
+        print(f"\nFedHyb训练完成")
+        print(f"最高准确率: {max_accuracy:.4f}")
+        print(f"最高F1分数: {max_f1:.4f}")
+        
+        # 保存结果到文件
+        self.save_results()
         
         return self.results
 
 def main():
-    """Main function to run FedCVG algorithm"""
     args = get_fedhyb_args()
-    fedcvg = FedCVG(args)
-    fedcvg.train()
+    fedhyb = FedHyb(args)
+    fedhyb.train()
 
 if __name__ == "__main__":
     main() 
