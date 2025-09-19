@@ -8,7 +8,7 @@ import os
 import torch
 import random
 import numpy as np
-from fedhyb import FedHyb
+from fedcvg import FedHyb
 from federated_parser import get_fedhyb_args
 
 def set_seed(seed):
